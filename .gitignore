@@ -1,0 +1,6 @@
+venv/
+.env
+__pycache__/
+chroma_db/
+chroma_db_fast/
+chroma_db_high_perf/
