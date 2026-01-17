@@ -13,18 +13,27 @@ from io import BytesIO
 
 # --- 1. SYSTEM CONFIGURATION ---
 st.set_page_config(page_title="High-Perf RAG", layout="wide")
-st.title("🚀 High-Performance RAG (BGE-Large + MMR)")
+st.title("🚀 High-Performance RAG (GPU Accelerated)")
 
-# Check if GPU is available for the heavy embedding model
+# --- GPU DIAGNOSTICS (THE FIX) ---
+# This block forces a check. If no GPU, it stops and tells you why.
+try:
+    if torch.cuda.is_available():
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(0)
+        st.sidebar.success(f"✅ GPU DETECTED: {gpu_name}")
+        st.sidebar.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        st.error("❌ NO GPU DETECTED!")
+        st.warning("You are running on CPU. To fix this, run: pip install torch --index-url https://download.pytorch.org/whl/cu121")
+        # Fallback to cpu just so app doesn't crash, but warn user
+        device = "cpu"
+except Exception as e:
+    st.error(f"GPU Check Failed: {e}")
+    device = "cpu"
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if device == "cuda":
-    st.sidebar.success(f"🚀 Running on GPU: {torch.cuda.get_device_name(0)}")
-else:
-    st.sidebar.warning("⚠️ Running on CPU (Slower)")
 # --- 2. INITIALIZE POWERFUL MODELS ---
 
-# API Key Setup
 api_key = st.sidebar.text_input("Enter Groq API Key", type="password")
 if not api_key:
     st.warning("Enter API Key to start.")
@@ -32,18 +41,20 @@ if not api_key:
 
 client = Groq(api_key=api_key)
 
-# LOAD STRONG EMBEDDING MODEL
-# We use 'BAAI/bge-large-en-v1.5' -> Top tier retrieval performance
+# LOAD STRONG EMBEDDING MODEL ON GPU
 @st.cache_resource
 def get_embedding_model():
-    # Explicitly tell it to use the device we found
+    # We use 'model_kwargs' to force the model onto the GPU (cuda)
+    encode_kwargs = {'normalize_embeddings': True} # Best practice for BGE
+    
     return HuggingFaceEmbeddings(
         model_name="BAAI/bge-large-en-v1.5",
-        model_kwargs={'device': device} 
-    
+        model_kwargs={'device': device},  # <--- CRITICAL: Sends model to GPU
+        encode_kwargs=encode_kwargs
     )
+
 try:
-    with st.spinner(f"Loading heavy model (BGE-Large)... this happens once."):
+    with st.spinner(f"Loading BGE-Large on {device.upper()}..."):
         embedding_model = get_embedding_model()
 except Exception as e:
     st.error(f"Model Load Error: {e}")
@@ -51,80 +62,66 @@ except Exception as e:
 
 persist_directory = "./chroma_db_high_perf"
 
-# --- 3. ADVANCED PDF PROCESSING (TABLE OPTIMIZED) ---
+# --- 3. ADVANCED PDF PROCESSING ---
 
 def process_documents(uploaded_files):
     documents = []
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.text(" extracting text with layout analysis...")
+    status_text.text("Extracting text...")
     
     for i, file in enumerate(uploaded_files):
         with pdfplumber.open(file) as pdf:
             file_text = ""
             for page in pdf.pages:
-                # Extract text preserving layout (crucial for tables)
                 text = page.extract_text(layout=True)
                 if text:
                     file_text += text + "\n\n"
             
-            # Create Document
             doc = Document(page_content=file_text, metadata={"source": file.name})
             documents.append(doc)
         progress_bar.progress((i + 1) / len(uploaded_files))
 
-    # CHUNKING STRATEGY FOR TABLES
-    # Tables are large. Small chunks break them. 
-    # We use a massive chunk size (2500) to keep full schedules together.
+    # Chunking
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2500,     # Large chunks for full table context
-        chunk_overlap=500,   # High overlap ensures no data is lost at cut points
-        separators=["\n\n", "\n", " ", ""] # Prioritize breaking at paragraphs/rows
+        chunk_size=2000, 
+        chunk_overlap=500, 
+        separators=["\n\n", "\n", " ", ""]
     )
     
     chunks = text_splitter.split_documents(documents)
-    status_text.text(f"Generating Embeddings for {len(chunks)} chunks (This will take time on CPU)...")
+    status_text.text(f"⚡ Encoding {len(chunks)} chunks on {device.upper()} (Fast)...")
     
     # Store in Chroma
+    # Chroma automatically uses the embedding_model which is now on GPU
     vector_store = Chroma.from_documents(
         documents=chunks, 
         embedding=embedding_model,
         persist_directory=persist_directory
     )
     
-    status_text.success(f"✅ Indexed {len(chunks)} chunks with BGE-Large!")
+    status_text.success(f"✅ Indexed {len(chunks)} chunks using {device}!")
     return vector_store
 
-# --- 4. ADVANCED RETRIEVAL & GENERATION ---
+# --- 4. RETRIEVAL & GENERATION ---
 
 def query_rag(question, vector_store):
-    # SEARCH STRATEGY: MMR (Maximal Marginal Relevance)
-    # Why? It fetches diverse chunks. If the answer is split across pages, MMR finds both.
     retriever = vector_store.as_retriever(
         search_type="mmr",
-        search_kwargs={
-            "k": 6,             # Return top 6 chunks
-            "fetch_k": 20,      # Look at top 20 candidates first
-            "lambda_mult": 0.7  # Balance between 'relevant' and 'diverse'
-        }
+        search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.7}
     )
     
     docs = retriever.invoke(question)
     context_text = "\n---\n".join([doc.page_content for doc in docs])
     
-    # DEBUG: Show what the AI sees
+    # Debug expander
     with st.expander("🔍 Debug: High-Res Context"):
         st.text(context_text)
     
-    # SYSTEM PROMPT FOR COMPLEX TASKS
     system_prompt = (
-        "You are an expert data analyst specialized in reading complex PDF tables. "
-        "The text provided maintains physical layout (rows/cols). "
-        "1. Analyze the Context carefully. "
-        "2. If looking for a specific value (like a date or subject), scan the columns vertically. "
-        "3. If the user asks for a specific code or department (e.g., '243' or 'AI&DS'), locate that section first. "
-        "4. Answer precisely based ONLY on the context."
+        "You are an expert data analyst. Use the provided context to answer the question. "
+        "If the context is a table, read across rows carefully."
     )
     
     completion = client.chat.completions.create(
@@ -161,7 +158,7 @@ st.sidebar.header("Data Source")
 uploaded_files = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files and st.sidebar.button("Process High-Res"):
-    with st.spinner("Processing with BGE-Large..."):
+    with st.spinner(f"Processing on {device}..."):
         st.session_state.vector_store = process_documents(uploaded_files)
 
 st.header("Analysis Chat")
