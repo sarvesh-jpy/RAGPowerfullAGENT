@@ -9,3 +9,4 @@ langchain-chroma
 sentence-transformers
 gTTS
 torch
+protobuf==3.20.3
